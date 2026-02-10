@@ -1,0 +1,25 @@
+{
+  "name": "@tjamescouch/niki",
+  "version": "0.1.0",
+  "description": "Deterministic process supervisor for AI agents — token budgets, rate limits, and abort control",
+  "bin": {
+    "niki": "./bin/niki"
+  },
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tjamescouch/niki"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "agent",
+    "supervisor",
+    "rate-limit",
+    "token-budget",
+    "claude",
+    "llm"
+  ]
+}
