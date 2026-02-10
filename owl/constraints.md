@@ -39,6 +39,12 @@
 - use a sliding 60-second window, not fixed calendar minutes.
 - prune stale timestamps before every limit check.
 
+## abort file
+
+- poll interval is jittered ±30% to avoid thundering herd and deterministic cadence.
+- use recursive setTimeout, not setInterval, so each tick has independent jitter.
+- only check file existence (stat), never read file contents.
+
 ## packaging
 
 - published as `@tjamescouch/niki` on npm.

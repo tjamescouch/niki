@@ -106,7 +106,7 @@ the kill controller handles graceful and forced termination of the child process
 
 ### interfaces
 
-- **input**: kill reason from budget check, timeout, or rate-limit check.
+- **input**: kill reason from budget check, timeout, rate-limit check, or abort-file detection.
 - **output**: SIGTERM and SIGKILL signals to the child process.
 
 ### invariants
@@ -140,3 +140,33 @@ the diagnostics logger writes timestamped operational events and, optionally, a 
 
 - diagnostics never contain message content, api tokens, or environment variables.
 - state json contains only counters, timestamps, pids, exit codes, and kill reasons.
+
+---
+
+## abort-watcher
+
+the abort watcher polls the filesystem for an external abort signal file, enabling out-of-band termination by operators or orchestration tools.
+
+### state
+
+- resolved abort file path (from `--abort-file`)
+- base poll interval (from `--poll-interval`)
+- current poll timer reference
+
+### capabilities
+
+- polls for the existence of an abort file at a jittered interval (±30% of base).
+- uses recursive setTimeout scheduling (not setInterval) so each tick has a unique delay.
+- triggers the kill controller with reason `abort` when the file is detected.
+- stops polling when the child is already killed or has exited.
+
+### interfaces
+
+- **input**: abort file path, poll interval, killed flag.
+- **output**: kill trigger with reason `abort`.
+
+### invariants
+
+- jitter is always ±30% of the base poll interval.
+- polling stops immediately once the killed flag is set.
+- the abort file is checked with `existsSync` (no open/read, just stat).

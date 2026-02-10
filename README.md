@@ -36,6 +36,9 @@ niki --budget 500000 --timeout 3600 -- claude -p "your prompt" --verbose
 # Strict: rate-limit sends and tool calls
 niki --budget 1000000 --max-sends 5 --max-tool-calls 20 -- claude -p "..." --verbose
 
+# With external abort file (touch this file to kill the agent)
+niki --budget 500000 --abort-file /tmp/niki-12345.abort -- claude -p "..." --verbose
+
 # With logging and state output
 niki --budget 500000 --log /tmp/niki.log --state /tmp/niki-state.json -- claude -p "..."
 ```
@@ -51,6 +54,8 @@ niki --budget 500000 --log /tmp/niki.log --state /tmp/niki-state.json -- claude 
 | `--log <file>` | none | Append diagnostics to file |
 | `--state <file>` | none | Write exit-state JSON on completion |
 | `--cooldown <seconds>` | `5` | Grace period after SIGTERM before SIGKILL |
+| `--abort-file <path>` | none | Poll this file for external abort signal |
+| `--poll-interval <ms>` | `1000` | Base poll interval for abort file (±30% jitter) |
 
 ## How it works
 
@@ -80,7 +85,7 @@ When `--state` is provided, niki writes a JSON snapshot on exit:
 }
 ```
 
-`killedBy` is one of: `"budget"`, `"timeout"`, `"rate-sends"`, `"rate-tools"`, or `null` (clean exit).
+`killedBy` is one of: `"budget"`, `"timeout"`, `"rate-sends"`, `"rate-tools"`, `"abort"`, or `null` (clean exit).
 
 ## Security
 
@@ -97,6 +102,7 @@ When `--state` is provided, niki writes a JSON snapshot on exit:
 | `timeout` | Wall-clock time exceeds `--timeout` |
 | `rate-sends` | More than `--max-sends` agentchat_send calls in 60s |
 | `rate-tools` | More than `--max-tool-calls` tool calls in 60s |
+| `abort` | External abort file detected at `--abort-file` path |
 
 ## License
 
