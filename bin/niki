@@ -8,6 +8,7 @@
  *   - Wall-clock timeout (kill if exceeded)
  *   - Tool-call rate limiting (kill if agent floods)
  *   - Diagnostics logging
+ *   - Automatic restart on exit (optional)
  *
  * Usage:
  *   niki [options] -- <command> [args...]
@@ -46,10 +47,14 @@ Options:
   --cooldown <seconds>    Grace period after SIGTERM before SIGKILL (default: 5)
   --abort-file <path>     Poll this file for external abort signal
   --poll-interval <ms>    Base poll interval in ms for abort file (default: 1000)
+  --restart               Restart the child process when it exits (default: off)
+  --max-restarts <n>      Max restart attempts, 0=unlimited (default: 0)
+  --restart-delay <secs>  Delay between restarts with ±30% jitter (default: 5)
 
 Examples:
   niki --budget 500000 -- claude -p "your prompt" --verbose
-  niki --timeout 1800 --max-sends 5 -- claude -p "..." --model sonnet --verbose`);
+  niki --timeout 1800 --max-sends 5 -- claude -p "..." --model sonnet --verbose
+  niki --restart --max-restarts 10 -- gro --model gpt-5.2 "your prompt"`);
   process.exit(1);
 }
 
@@ -73,6 +78,9 @@ const { values: opts } = parseArgs({
     cooldown:        { type: 'string', default: '5' },
     'abort-file':    { type: 'string' },
     'poll-interval': { type: 'string', default: '1000' },
+    restart:         { type: 'boolean', default: false },
+    'max-restarts':  { type: 'string', default: '0' },
+    'restart-delay': { type: 'string', default: '5' },
   },
 });
 
@@ -89,6 +97,9 @@ const ABORT_FILE    = opts['abort-file'] ? resolve(opts['abort-file']) : null;
 const POLL_INTERVAL = parseInt(opts['poll-interval'], 10);
 const LOG_FILE      = opts.log;
 const STATE_FILE    = opts.state;
+const RESTART       = opts.restart;
+const MAX_RESTARTS  = parseInt(opts['max-restarts'], 10);
+const RESTART_DELAY_S = parseFloat(opts['restart-delay']);
 
 // --- State ---
 
@@ -109,6 +120,7 @@ const state = {
   stallEvents: 0,
   nudges: 0,
   deadAirChecks: 0,
+  restarts: 0,
 };
 
 // Sliding window for per-minute rate limiting
@@ -329,6 +341,14 @@ function hasConsumedCpu(pid) {
   return cpuMs > prev;
 }
 
+// --- Jitter utility ---
+
+function jitteredDelay(base) {
+  // ±30% jitter
+  const jitter = base * 0.3;
+  return base + (Math.random() * 2 * jitter - jitter);
+}
+
 // --- Dead air detection ---
 
 let deadAirStart = null;   // Timestamp when dead air began (null = not in dead air)
@@ -456,87 +476,46 @@ function onStallDetected() {
   killChild('stall');
 }
 
-// --- Spawn child process ---
+// --- Restart logic ---
 
-log(`Starting: ${childCmd} ${childArgs.join(' ').substring(0, 100)}...`);
-log(`Budget: ${BUDGET} tokens | Timeout: ${TIMEOUT_S}s | Startup: ${STARTUP_TIMEOUT_S}s | Stall: ${STALL_TIMEOUT_S}s | Dead air: ${DEAD_AIR_TIMEOUT_M}min | Max sends: ${MAX_SENDS}/min | Max tools: ${MAX_TOOL_CALLS}/min`);
+// Reasons that should NOT trigger a restart (hard limits / operator intent)
+const NO_RESTART_REASONS = new Set(['budget', 'rate-sends', 'rate-tools', 'abort']);
+let nikiTerminated = false; // Set when niki itself receives SIGTERM/SIGINT
 
-child = spawn(childCmd, childArgs, {
-  stdio: ['pipe', 'pipe', 'pipe'],  // All piped: niki controls stdin, monitors stdout+stderr
-  env: process.env,  // Inherit env (tokens stay in env, never logged)
-});
-
-state.pid = child.pid;
-
-// Close stdin immediately — claude -p should never need interactive input.
-// This prevents blocking on trust prompts, permission prompts, or stdin reads.
-closeStdin();
-
-// --- Monitor stdout ---
-
-child.stdout.on('data', (chunk) => {
-  // Forward to our stdout (preserves runner's | tee pipeline)
-  process.stdout.write(chunk);
-  onChildOutput();
-  checkForPrompts(chunk.toString());
-});
-
-// --- Monitor stderr ---
-
-let stderrBuffer = '';
-
-child.stderr.on('data', (chunk) => {
-  const text = chunk.toString();
-
-  // Always forward stderr to our stderr (so supervisor captures it)
-  process.stderr.write(chunk);
-  onChildOutput();
-
-  // Buffer and parse line by line
-  stderrBuffer += text;
-  const lines = stderrBuffer.split('\n');
-  stderrBuffer = lines.pop(); // Keep incomplete last line in buffer
-
-  for (const line of lines) {
-    parseTokens(line);
-    parseToolCall(line);
-
-    // Check budget
-    if (state.tokensTotal > BUDGET) {
-      killChild('budget');
-      return;
-    }
-
-    // Check rate limits
-    const rateViolation = checkRateLimits();
-    if (rateViolation) {
-      killChild(rateViolation);
-      return;
-    }
-  }
-});
-
-// Start stall detection
-if (STALL_TIMEOUT_S > 0 || STARTUP_TIMEOUT_S > 0) {
-  log(`Stall detection: startup-timeout=${STARTUP_TIMEOUT_S}s, stall-timeout=${STALL_TIMEOUT_S}s, max-nudges=${MAX_NUDGES}`);
-  resetStallTimer();
+function shouldRestart(code, signal) {
+  if (!RESTART) return false;
+  if (nikiTerminated) return false;
+  if (state.killedBy && NO_RESTART_REASONS.has(state.killedBy)) return false;
+  if (MAX_RESTARTS > 0 && state.restarts >= MAX_RESTARTS) return false;
+  return true;
 }
 
-// Start dead air detection
-if (DEAD_AIR_TIMEOUT_M > 0) {
-  log(`Dead air detection: ${DEAD_AIR_TIMEOUT_M}min threshold, ${Math.round(DEAD_AIR_POLL_MS / 1000)}s poll interval`);
-  scheduleDeadAirPoll();
+function resetPerRunState() {
+  // Reset per-run flags but keep cumulative counters (tokens, toolCalls, etc.)
+  killed = false;
+  state.killedBy = null;
+  state.exitCode = null;
+  state.exitSignal = null;
+  state.gotFirstOutput = undefined;
+
+  // Reset stall/dead-air detection
+  nudgeCount = 0;
+  stdinClosed = false;
+  lastOutputTime = Date.now();
+  gotFirstOutput = false;
+  lastCpuMs = null;
+  deadAirStart = null;
+
+  // Clear rate limit windows (fresh session)
+  toolCallTimestamps.length = 0;
+  sendCallTimestamps.length = 0;
+  state.toolCallsThisMinute = 0;
+  state.sendCallsThisMinute = 0;
 }
 
-// --- Abort file polling (with jitter) ---
+// --- Abort file polling ---
 
 let abortPollId = null;
-
-function jitteredDelay(base) {
-  // ±30% jitter
-  const jitter = base * 0.3;
-  return base + (Math.random() * 2 * jitter - jitter);
-}
 
 function scheduleAbortPoll() {
   if (!ABORT_FILE || killed) return;
@@ -551,41 +530,136 @@ function scheduleAbortPoll() {
   }, jitteredDelay(POLL_INTERVAL));
 }
 
-if (ABORT_FILE) {
-  log(`Abort file: ${ABORT_FILE} (poll: ${POLL_INTERVAL}ms ±30% jitter)`);
-  scheduleAbortPoll();
+// --- Spawn and monitor child ---
+
+let timeoutId = null;
+
+function startChild() {
+  log(`Starting: ${childCmd} ${childArgs.join(' ').substring(0, 100)}...`);
+  log(`Budget: ${BUDGET} tokens | Timeout: ${TIMEOUT_S}s | Startup: ${STARTUP_TIMEOUT_S}s | Stall: ${STALL_TIMEOUT_S}s | Dead air: ${DEAD_AIR_TIMEOUT_M}min | Max sends: ${MAX_SENDS}/min | Max tools: ${MAX_TOOL_CALLS}/min`);
+  if (RESTART) {
+    log(`Restart: enabled | max: ${MAX_RESTARTS || 'unlimited'} | delay: ${RESTART_DELAY_S}s ±30% | restarts so far: ${state.restarts}`);
+  }
+
+  child = spawn(childCmd, childArgs, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: process.env,
+  });
+
+  state.pid = child.pid;
+
+  // Close stdin immediately — claude -p should never need interactive input.
+  closeStdin();
+
+  // --- Monitor stdout ---
+
+  child.stdout.on('data', (chunk) => {
+    process.stdout.write(chunk);
+    onChildOutput();
+    checkForPrompts(chunk.toString());
+  });
+
+  // --- Monitor stderr ---
+
+  let stderrBuffer = '';
+
+  child.stderr.on('data', (chunk) => {
+    const text = chunk.toString();
+    process.stderr.write(chunk);
+    onChildOutput();
+
+    stderrBuffer += text;
+    const lines = stderrBuffer.split('\n');
+    stderrBuffer = lines.pop();
+
+    for (const line of lines) {
+      parseTokens(line);
+      parseToolCall(line);
+
+      if (state.tokensTotal > BUDGET) {
+        killChild('budget');
+        return;
+      }
+
+      const rateViolation = checkRateLimits();
+      if (rateViolation) {
+        killChild(rateViolation);
+        return;
+      }
+    }
+  });
+
+  // Start stall detection
+  if (STALL_TIMEOUT_S > 0 || STARTUP_TIMEOUT_S > 0) {
+    log(`Stall detection: startup-timeout=${STARTUP_TIMEOUT_S}s, stall-timeout=${STALL_TIMEOUT_S}s, max-nudges=${MAX_NUDGES}`);
+    resetStallTimer();
+  }
+
+  // Start dead air detection
+  if (DEAD_AIR_TIMEOUT_M > 0) {
+    log(`Dead air detection: ${DEAD_AIR_TIMEOUT_M}min threshold, ${Math.round(DEAD_AIR_POLL_MS / 1000)}s poll interval`);
+    scheduleDeadAirPoll();
+  }
+
+  // Abort file polling
+  if (ABORT_FILE) {
+    log(`Abort file: ${ABORT_FILE} (poll: ${POLL_INTERVAL}ms ±30% jitter)`);
+    scheduleAbortPoll();
+  }
+
+  // Per-run timeout
+  timeoutId = setTimeout(() => {
+    killChild('timeout');
+  }, TIMEOUT_S * 1000);
+
+  // --- Exit handler ---
+
+  child.on('exit', (code, signal) => {
+    clearTimeout(timeoutId);
+    if (stallTimer) clearTimeout(stallTimer);
+    if (abortPollId) clearTimeout(abortPollId);
+    if (deadAirPollId) clearTimeout(deadAirPollId);
+
+    state.exitCode = code;
+    state.exitSignal = signal;
+    state.duration = Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000);
+    state.gotFirstOutput = gotFirstOutput;
+
+    log(`Exit — code: ${code} signal: ${signal} | tokens: ${state.tokensTotal} | tools: ${state.toolCalls} | sends: ${state.sendCalls} | duration: ${state.duration}s | output: ${gotFirstOutput}${state.killedBy ? ` | killed: ${state.killedBy}` : ''} | restarts: ${state.restarts}`);
+    writeState();
+
+    if (shouldRestart(code, signal)) {
+      state.restarts++;
+      const delay = jitteredDelay(RESTART_DELAY_S * 1000);
+      log(`RESTART — attempt ${state.restarts}${MAX_RESTARTS > 0 ? `/${MAX_RESTARTS}` : ''} in ${Math.round(delay / 1000)}s`);
+      resetPerRunState();
+      setTimeout(() => {
+        startChild();
+      }, delay);
+    } else {
+      if (RESTART && !shouldRestart(code, signal)) {
+        const reason = nikiTerminated ? 'niki received signal' :
+          (state.killedBy && NO_RESTART_REASONS.has(state.killedBy)) ? `hard kill (${state.killedBy})` :
+          (MAX_RESTARTS > 0 && state.restarts >= MAX_RESTARTS) ? `max restarts reached (${MAX_RESTARTS})` :
+          'restart not enabled';
+        log(`NOT RESTARTING — ${reason}`);
+      }
+      if (logStream) logStream.end();
+      process.exit(code ?? 1);
+    }
+  });
 }
-
-// --- Timeout ---
-
-const timeoutId = setTimeout(() => {
-  killChild('timeout');
-}, TIMEOUT_S * 1000);
-
-// --- Clean exit ---
-
-child.on('exit', (code, signal) => {
-  clearTimeout(timeoutId);
-  if (stallTimer) clearTimeout(stallTimer);
-  if (abortPollId) clearTimeout(abortPollId);
-  if (deadAirPollId) clearTimeout(deadAirPollId);
-  state.exitCode = code;
-  state.exitSignal = signal;
-  state.duration = Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000);
-
-  state.gotFirstOutput = gotFirstOutput;
-  log(`Exit — code: ${code} signal: ${signal} | tokens: ${state.tokensTotal} | tools: ${state.toolCalls} | sends: ${state.sendCalls} | duration: ${state.duration}s | output: ${gotFirstOutput}${state.killedBy ? ` | killed: ${state.killedBy}` : ''}`);
-  writeState();
-
-  if (logStream) logStream.end();
-  process.exit(code ?? 1);
-});
 
 // --- Signal forwarding ---
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     log(`Received ${sig}, forwarding to child`);
+    nikiTerminated = true;
     if (child) child.kill(sig);
   });
 }
+
+// --- Start ---
+
+startChild();
