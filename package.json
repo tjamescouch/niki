@@ -5,6 +5,11 @@
   "bin": {
     "niki": "./bin/niki"
   },
+  "files": [
+    "bin/niki",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
   "license": "MIT",
   "repository": {
