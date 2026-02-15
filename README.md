@@ -53,6 +53,7 @@ niki --budget 500000 --log /tmp/niki.log --state /tmp/niki-state.json -- claude 
 | `--max-tool-calls <n>` | `30` | Max total tool calls per minute |
 | `--log <file>` | none | Append diagnostics to file |
 | `--state <file>` | none | Write exit-state JSON on completion |
+| `--metrics <file>` | none | Append session metrics as JSONL on exit (cumulative across runs) |
 | `--cooldown <seconds>` | `5` | Grace period after SIGTERM before SIGKILL |
 | `--abort-file <path>` | none | Poll this file for external abort signal |
 | `--poll-interval <ms>` | `1000` | Base poll interval for abort file (±30% jitter) |
@@ -84,6 +85,24 @@ When `--state` is provided, niki writes a JSON snapshot on exit:
   "duration": 1234
 }
 ```
+
+
+## Metrics file
+
+When `--metrics` is provided, niki **appends** one JSON line per session exit. The file grows across restarts, giving you a full history:
+
+```bash
+# View last 5 sessions
+tail -5 /tmp/niki-metrics.jsonl | jq .
+
+# Total tokens across all sessions
+cat /tmp/niki-metrics.jsonl | jq -s '[.[].tokensTotal] | add'
+
+# Sessions killed by reason
+cat /tmp/niki-metrics.jsonl | jq -s 'group_by(.killedBy) | map({reason: .[0].killedBy, count: length})'
+```
+
+Each line contains the full session state plus `endedAt`, `budget`, and `timeoutS` for context.
 
 `killedBy` is one of: `"budget"`, `"timeout"`, `"rate-sends"`, `"rate-tools"`, `"abort"`, or `null` (clean exit).
 

@@ -21,7 +21,7 @@
  */
 
 import { spawn, execSync } from 'node:child_process';
-import { createWriteStream, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { createWriteStream, writeFileSync, appendFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
@@ -40,12 +40,13 @@ Options:
   --max-tool-calls <n>    Max total tool calls per minute (default: 30)
   --stall-timeout <secs>  Kill after N seconds of no output (default: 60, 0=disabled)
   --startup-timeout <s>   Longer stall timeout until first output (default: 180, 0=use stall-timeout)
-  --dead-air-timeout <m>  Minutes of zero CPU + zero output before kill (default: 5, 0=disabled)
+  --dead-air-timeout <m>  Minutes of zero CPU + zero output before kill (default: 1440, 0=disabled)
   --max-nudges <n>        Max stdin nudge attempts before kill on stall (default: 3)
   --log <file>            Write diagnostics log to file
   --log-level <level>     Minimum log level: debug, info, warn, error (default: info)
   --log-json              Emit logs as JSON lines (for machine parsing)
   --state <file>          Write state JSON on exit (budget used, reason, etc.)
+  --metrics <file>        Append session metrics as JSONL on exit (cumulative across runs)
   --cooldown <seconds>    Grace period after SIGTERM before SIGKILL (default: 5)
   --abort-file <path>     Poll this file for external abort signal
   --poll-interval <ms>    Base poll interval in ms for abort file (default: 1000)
@@ -73,12 +74,13 @@ const { values: opts } = parseArgs({
     'max-tool-calls': { type: 'string', default: '30' },
     'stall-timeout': { type: 'string', default: '60' },
     'startup-timeout': { type: 'string', default: '180' },
-    'dead-air-timeout': { type: 'string', default: '5' },
+    'dead-air-timeout': { type: 'string', default: '1440' },
     'max-nudges':    { type: 'string', default: '3' },
     log:             { type: 'string' },
     'log-level':     { type: 'string', default: 'info' },
     'log-json':      { type: 'boolean', default: false },
     state:           { type: 'string' },
+    metrics:         { type: 'string' },
     cooldown:        { type: 'string', default: '5' },
     'abort-file':    { type: 'string' },
     'poll-interval': { type: 'string', default: '1000' },
@@ -101,6 +103,7 @@ const ABORT_FILE    = opts['abort-file'] ? resolve(opts['abort-file']) : null;
 const POLL_INTERVAL = parseInt(opts['poll-interval'], 10);
 const LOG_FILE      = opts.log;
 const STATE_FILE    = opts.state;
+const METRICS_FILE  = opts.metrics;
 const RESTART       = opts.restart;
 const MAX_RESTARTS  = parseInt(opts['max-restarts'], 10);
 const RESTART_DELAY_S = parseFloat(opts['restart-delay']);
@@ -176,6 +179,24 @@ function writeState() {
     writeFileSync(resolve(STATE_FILE), JSON.stringify(state, null, 2) + '\n');
   } catch {
     // Best effort
+  }
+}
+
+function writeMetrics() {
+  if (!METRICS_FILE) return;
+  try {
+    const p = resolve(METRICS_FILE);
+    mkdirSync(dirname(p), { recursive: true });
+    // Append one JSON line per session — never overwrite, never truncate
+    const entry = JSON.stringify({
+      ...state,
+      endedAt: new Date().toISOString(),
+      budget: BUDGET,
+      timeoutS: TIMEOUT_S,
+    });
+    appendFileSync(p, entry + '\n');
+  } catch {
+    // Best effort — metrics are not worth crashing over
   }
 }
 
@@ -687,6 +708,7 @@ function startChild() {
     const level = state.killedBy ? 'error' : (code === 0 ? 'info' : 'warn');
     log(`Exit — code: ${code} signal: ${signal} | tokens: ${state.tokensTotal.toLocaleString()} | tools: ${state.toolCalls} | sends: ${state.sendCalls} | duration: ${state.duration}s | output: ${gotFirstOutput}${state.killedBy ? ` | killed: ${state.killedBy}` : ''} | restarts: ${state.restarts}`, level);
     writeState();
+    writeMetrics();
 
     if (shouldRestart(code, signal)) {
       state.restarts++;
