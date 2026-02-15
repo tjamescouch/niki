@@ -43,8 +43,6 @@ Options:
   --dead-air-timeout <m>  Minutes of zero CPU + zero output before kill (default: 5, 0=disabled)
   --max-nudges <n>        Max stdin nudge attempts before kill on stall (default: 3)
   --log <file>            Write diagnostics log to file
-  --log-level <level>     Minimum log level: debug, info, warn, error (default: info)
-  --log-json              Emit logs as JSON lines (for machine parsing)
   --state <file>          Write state JSON on exit (budget used, reason, etc.)
   --cooldown <seconds>    Grace period after SIGTERM before SIGKILL (default: 5)
   --abort-file <path>     Poll this file for external abort signal
@@ -76,8 +74,6 @@ const { values: opts } = parseArgs({
     'dead-air-timeout': { type: 'string', default: '5' },
     'max-nudges':    { type: 'string', default: '3' },
     log:             { type: 'string' },
-    'log-level':     { type: 'string', default: 'info' },
-    'log-json':      { type: 'boolean', default: false },
     state:           { type: 'string' },
     cooldown:        { type: 'string', default: '5' },
     'abort-file':    { type: 'string' },
@@ -104,12 +100,7 @@ const STATE_FILE    = opts.state;
 const RESTART       = opts.restart;
 const MAX_RESTARTS  = parseInt(opts['max-restarts'], 10);
 const RESTART_DELAY_S = parseFloat(opts['restart-delay']);
-const LOG_JSON      = opts['log-json'];
 
-// --- Log levels ---
-
-const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
-const LOG_LEVEL = LOG_LEVELS[opts['log-level']] ?? LOG_LEVELS.info;
 // --- State ---
 
 const state = {
@@ -136,10 +127,6 @@ const state = {
 const toolCallTimestamps = [];
 const sendCallTimestamps = [];
 
-// Budget threshold tracking — warn once at each level
-const BUDGET_THRESHOLDS = [0.5, 0.75, 0.9];
-const budgetWarned = new Set();
-
 // --- Logging ---
 
 let logStream = null;
@@ -148,24 +135,11 @@ if (LOG_FILE) {
   logStream = createWriteStream(resolve(LOG_FILE), { flags: 'a' });
 }
 
-function log(msg, level = 'info', fields = null) {
-  const numLevel = LOG_LEVELS[level] ?? LOG_LEVELS.info;
-  if (numLevel < LOG_LEVEL) return;
-
-  const ts = new Date().toISOString();
-
-  if (LOG_JSON) {
-    const entry = { ts, level, msg, ...state };
-    if (fields) Object.assign(entry, fields);
-    const json = JSON.stringify(entry);
-    if (logStream) logStream.write(json + '\n');
-    process.stderr.write(json + '\n');
-  } else {
-    const prefix = level === 'info' ? '' : `[${level.toUpperCase()}] `;
-    const line = `[${ts}] ${prefix}${msg}`;
-    if (logStream) logStream.write(line + '\n');
-    process.stderr.write(`[niki] ${line}\n`);
-  }
+function log(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  if (logStream) logStream.write(line + '\n');
+  // Also write to stderr so supervisor can capture it
+  process.stderr.write(`[niki] ${line}\n`);
 }
 
 function writeState() {
@@ -179,20 +153,6 @@ function writeState() {
   }
 }
 
-// --- Budget threshold warnings ---
-
-function checkBudgetThresholds() {
-  if (BUDGET <= 0) return;
-  const pct = state.tokensTotal / BUDGET;
-  for (const threshold of BUDGET_THRESHOLDS) {
-    if (pct >= threshold && !budgetWarned.has(threshold)) {
-      budgetWarned.add(threshold);
-      const used = state.tokensTotal;
-      const remaining = BUDGET - used;
-      log(`Budget ${Math.round(threshold * 100)}% — ${used.toLocaleString()}/${BUDGET.toLocaleString()} tokens used, ${remaining.toLocaleString()} remaining`, 'warn');
-    }
-  }
-}
 // --- Token parsing from stderr ---
 
 // Claude --verbose outputs token usage in stderr. Patterns vary by version.
@@ -215,7 +175,6 @@ const TOKEN_PATTERNS = [
 ];
 
 function parseTokens(line) {
-  let changed = false;
   for (const { regex, field } of TOKEN_PATTERNS) {
     regex.lastIndex = 0;
     let match;
@@ -223,39 +182,30 @@ function parseTokens(line) {
       const count = parseInt(match[1], 10);
       if (isNaN(count) || count <= 0) continue;
       if (field === 'in') {
-        if (count > state.tokensIn) { state.tokensIn = count; changed = true; }
+        state.tokensIn = Math.max(state.tokensIn, count);
       } else {
-        if (count > state.tokensOut) { state.tokensOut = count; changed = true; }
+        state.tokensOut = Math.max(state.tokensOut, count);
       }
       state.tokensTotal = state.tokensIn + state.tokensOut;
     }
-  }
-  if (changed) {
-    log(`Tokens — in: ${state.tokensIn.toLocaleString()} out: ${state.tokensOut.toLocaleString()} total: ${state.tokensTotal.toLocaleString()}/${BUDGET.toLocaleString()} (${Math.round(state.tokensTotal / BUDGET * 100)}%)`, 'debug');
-    checkBudgetThresholds();
   }
 }
 
 // --- Tool call detection from stderr ---
 
 // Claude --verbose logs tool calls. We detect sends specifically.
-const TOOL_CALL_PATTERN = /(?:Using tool|Tool call|tool_use)[:\s]*(\S+)/i;
+const TOOL_CALL_PATTERN = /(?:Using tool|Tool call|tool_use).*?(\w+)/i;
 const SEND_PATTERN = /agentchat_send/i;
 
 function parseToolCall(line) {
-  const toolMatch = line.match(TOOL_CALL_PATTERN);
-  if (toolMatch) {
+  if (TOOL_CALL_PATTERN.test(line)) {
     const now = Date.now();
-    const toolName = toolMatch[1] || 'unknown';
     state.toolCalls++;
     toolCallTimestamps.push(now);
 
     if (SEND_PATTERN.test(line)) {
       state.sendCalls++;
       sendCallTimestamps.push(now);
-      log(`Tool call #${state.toolCalls}: ${toolName} (send #${state.sendCalls}, ${state.sendCallsThisMinute + 1}/${MAX_SENDS}/min)`, 'info');
-    } else {
-      log(`Tool call #${state.toolCalls}: ${toolName} (${state.toolCallsThisMinute + 1}/${MAX_TOOL_CALLS}/min)`, 'debug');
     }
   }
 }
@@ -276,14 +226,6 @@ function checkRateLimits() {
   state.toolCallsThisMinute = toolCallTimestamps.length;
   state.sendCallsThisMinute = sendCallTimestamps.length;
 
-  // Warn at 80% of rate limits
-  if (state.sendCallsThisMinute === Math.ceil(MAX_SENDS * 0.8)) {
-    log(`Rate warning — sends at ${state.sendCallsThisMinute}/${MAX_SENDS}/min (80% threshold)`, 'warn');
-  }
-  if (state.toolCallsThisMinute === Math.ceil(MAX_TOOL_CALLS * 0.8)) {
-    log(`Rate warning — tool calls at ${state.toolCallsThisMinute}/${MAX_TOOL_CALLS}/min (80% threshold)`, 'warn');
-  }
-
   if (sendCallTimestamps.length > MAX_SENDS) {
     return 'rate-sends';
   }
@@ -292,6 +234,7 @@ function checkRateLimits() {
   }
   return null;
 }
+
 // --- Kill logic ---
 
 let child = null;
@@ -301,7 +244,7 @@ function killChild(reason) {
   if (killed || !child) return;
   killed = true;
   state.killedBy = reason;
-  log(`KILL — reason: ${reason} | tokens: ${state.tokensTotal}/${BUDGET} | sends: ${state.sendCallsThisMinute}/min | tools: ${state.toolCallsThisMinute}/min`, 'error');
+  log(`KILL — reason: ${reason} | tokens: ${state.tokensTotal}/${BUDGET} | sends: ${state.sendCallsThisMinute}/min | tools: ${state.toolCallsThisMinute}/min`);
 
   child.kill('SIGTERM');
 
@@ -331,7 +274,7 @@ const PROMPT_PATTERNS = [
 function checkForPrompts(text) {
   for (const pattern of PROMPT_PATTERNS) {
     if (pattern.test(text)) {
-      log(`PROMPT detected in stdout: ${text.trim().substring(0, 100)}`, 'warn');
+      log(`PROMPT detected in stdout: ${text.trim().substring(0, 100)}`);
       state.stallEvents++;
       // Close stdin to dismiss the prompt
       closeStdin();
@@ -405,6 +348,7 @@ function jitteredDelay(base) {
   const jitter = base * 0.3;
   return base + (Math.random() * 2 * jitter - jitter);
 }
+
 // --- Dead air detection ---
 
 let deadAirStart = null;   // Timestamp when dead air began (null = not in dead air)
@@ -420,7 +364,7 @@ function checkDeadAir() {
   if (cpuActive) {
     // Process is working — reset dead air, let it cook
     if (deadAirStart) {
-      log(`Dead air cleared — CPU active after ${Math.round((Date.now() - deadAirStart) / 1000)}s of silence`, 'info');
+      log(`Dead air cleared — CPU active after ${Math.round((Date.now() - deadAirStart) / 1000)}s of silence`);
       deadAirStart = null;
     }
     return;
@@ -429,17 +373,17 @@ function checkDeadAir() {
   // Zero CPU + zero output
   if (!deadAirStart) {
     deadAirStart = Date.now();
-    log(`Dead air started — zero CPU, ${silenceSec}s silence`, 'warn');
+    log(`Dead air started — zero CPU, ${silenceSec}s silence`);
   }
 
   const deadAirMin = (Date.now() - deadAirStart) / 60_000;
   if (deadAirMin >= DEAD_AIR_TIMEOUT_M) {
-    log(`DEAD AIR — zero CPU + zero output for ${Math.round(deadAirMin)}min (threshold: ${DEAD_AIR_TIMEOUT_M}min)`, 'error');
+    log(`DEAD AIR — zero CPU + zero output for ${Math.round(deadAirMin)}min (threshold: ${DEAD_AIR_TIMEOUT_M}min)`);
     killChild('dead-air');
     return;
   }
 
-  log(`Dead air check — zero CPU, ${Math.round(deadAirMin * 10) / 10}/${DEAD_AIR_TIMEOUT_M}min, ${silenceSec}s silence`, 'debug');
+  log(`Dead air check — zero CPU, ${Math.round(deadAirMin * 10) / 10}/${DEAD_AIR_TIMEOUT_M}min, ${silenceSec}s silence`);
 }
 
 // Poll interval: min(30s, threshold/3) — fast polls for short thresholds, 30s cap for production
@@ -467,12 +411,12 @@ function onChildOutput() {
   lastOutputTime = Date.now();
   // Reset dead air — got real output
   if (deadAirStart) {
-    log(`Dead air cleared — received output after ${Math.round((Date.now() - deadAirStart) / 1000)}s`, 'info');
+    log(`Dead air cleared — received output after ${Math.round((Date.now() - deadAirStart) / 1000)}s`);
     deadAirStart = null;
   }
   if (!gotFirstOutput) {
     gotFirstOutput = true;
-    log(`First output received after ${Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000)}s — switching to stall-timeout=${STALL_TIMEOUT_S}s`, 'info');
+    log(`First output received after ${Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000)}s — switching to stall-timeout=${STALL_TIMEOUT_S}s`);
   }
   resetStallTimer();
 }
@@ -494,14 +438,14 @@ function closeStdin() {
   if (stdinClosed || !child) return;
   stdinClosed = true;
   try { child.stdin.end(); } catch { /* already closed */ }
-  log('Stdin: closed (EOF)', 'debug');
+  log('Stdin: closed (EOF)');
 }
 
 function onStallDetected() {
   if (killed) return;
   state.stallEvents++;
   const silence = Math.round((Date.now() - lastOutputTime) / 1000);
-  log(`STALL — no output for ${silence}s (nudges: ${nudgeCount}/${MAX_NUDGES})`, 'warn');
+  log(`STALL — no output for ${silence}s (nudges: ${nudgeCount}/${MAX_NUDGES})`);
 
   // Escalation: close stdin → nudge → check CPU → kill
   if (!stdinClosed) {
@@ -513,7 +457,7 @@ function onStallDetected() {
   if (nudgeCount < MAX_NUDGES && !child.stdin.writableEnded) {
     nudgeCount++;
     state.nudges = nudgeCount;
-    log(`Stall nudge #${nudgeCount}`, 'info');
+    log(`Stall nudge #${nudgeCount}`);
     resetStallTimer();
     return;
   }
@@ -523,7 +467,7 @@ function onStallDetected() {
   if (DEAD_AIR_TIMEOUT_M > 0 && child) {
     const cpuActive = hasConsumedCpu(child.pid);
     if (cpuActive) {
-      log(`Stall deferred — process has CPU activity, deferring to dead-air detection`, 'info');
+      log(`Stall deferred — process has CPU activity, deferring to dead-air detection`);
       resetStallTimer();
       return;
     }
@@ -531,6 +475,7 @@ function onStallDetected() {
 
   killChild('stall');
 }
+
 // --- Restart logic ---
 
 // Reasons that should NOT trigger a restart (hard limits / operator intent)
@@ -566,9 +511,6 @@ function resetPerRunState() {
   sendCallTimestamps.length = 0;
   state.toolCallsThisMinute = 0;
   state.sendCallsThisMinute = 0;
-
-  // Reset budget warnings for fresh run
-  budgetWarned.clear();
 }
 
 // --- Abort file polling ---
@@ -580,7 +522,7 @@ function scheduleAbortPoll() {
   abortPollId = setTimeout(() => {
     if (killed) return;
     if (existsSync(ABORT_FILE)) {
-      log(`Abort file detected: ${ABORT_FILE}`, 'warn');
+      log(`Abort file detected: ${ABORT_FILE}`);
       killChild('abort');
       return;
     }
@@ -593,10 +535,10 @@ function scheduleAbortPoll() {
 let timeoutId = null;
 
 function startChild() {
-  log(`Starting: ${childCmd} ${childArgs.join(' ').substring(0, 100)}...`, 'info');
-  log(`Budget: ${BUDGET.toLocaleString()} tokens | Timeout: ${TIMEOUT_S}s | Startup: ${STARTUP_TIMEOUT_S}s | Stall: ${STALL_TIMEOUT_S}s | Dead air: ${DEAD_AIR_TIMEOUT_M}min | Max sends: ${MAX_SENDS}/min | Max tools: ${MAX_TOOL_CALLS}/min`, 'info');
+  log(`Starting: ${childCmd} ${childArgs.join(' ').substring(0, 100)}...`);
+  log(`Budget: ${BUDGET} tokens | Timeout: ${TIMEOUT_S}s | Startup: ${STARTUP_TIMEOUT_S}s | Stall: ${STALL_TIMEOUT_S}s | Dead air: ${DEAD_AIR_TIMEOUT_M}min | Max sends: ${MAX_SENDS}/min | Max tools: ${MAX_TOOL_CALLS}/min`);
   if (RESTART) {
-    log(`Restart: enabled | max: ${MAX_RESTARTS || 'unlimited'} | delay: ${RESTART_DELAY_S}s ±30% | restarts so far: ${state.restarts}`, 'info');
+    log(`Restart: enabled | max: ${MAX_RESTARTS || 'unlimited'} | delay: ${RESTART_DELAY_S}s ±30% | restarts so far: ${state.restarts}`);
   }
 
   child = spawn(childCmd, childArgs, {
@@ -605,7 +547,6 @@ function startChild() {
   });
 
   state.pid = child.pid;
-  log(`Child PID: ${child.pid}`, 'debug');
 
   // Close stdin immediately — claude -p should never need interactive input.
   closeStdin();
@@ -650,19 +591,19 @@ function startChild() {
 
   // Start stall detection
   if (STALL_TIMEOUT_S > 0 || STARTUP_TIMEOUT_S > 0) {
-    log(`Stall detection: startup-timeout=${STARTUP_TIMEOUT_S}s, stall-timeout=${STALL_TIMEOUT_S}s, max-nudges=${MAX_NUDGES}`, 'info');
+    log(`Stall detection: startup-timeout=${STARTUP_TIMEOUT_S}s, stall-timeout=${STALL_TIMEOUT_S}s, max-nudges=${MAX_NUDGES}`);
     resetStallTimer();
   }
 
   // Start dead air detection
   if (DEAD_AIR_TIMEOUT_M > 0) {
-    log(`Dead air detection: ${DEAD_AIR_TIMEOUT_M}min threshold, ${Math.round(DEAD_AIR_POLL_MS / 1000)}s poll interval`, 'info');
+    log(`Dead air detection: ${DEAD_AIR_TIMEOUT_M}min threshold, ${Math.round(DEAD_AIR_POLL_MS / 1000)}s poll interval`);
     scheduleDeadAirPoll();
   }
 
   // Abort file polling
   if (ABORT_FILE) {
-    log(`Abort file: ${ABORT_FILE} (poll: ${POLL_INTERVAL}ms ±30% jitter)`, 'info');
+    log(`Abort file: ${ABORT_FILE} (poll: ${POLL_INTERVAL}ms ±30% jitter)`);
     scheduleAbortPoll();
   }
 
@@ -684,14 +625,13 @@ function startChild() {
     state.duration = Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000);
     state.gotFirstOutput = gotFirstOutput;
 
-    const level = state.killedBy ? 'error' : (code === 0 ? 'info' : 'warn');
-    log(`Exit — code: ${code} signal: ${signal} | tokens: ${state.tokensTotal.toLocaleString()} | tools: ${state.toolCalls} | sends: ${state.sendCalls} | duration: ${state.duration}s | output: ${gotFirstOutput}${state.killedBy ? ` | killed: ${state.killedBy}` : ''} | restarts: ${state.restarts}`, level);
+    log(`Exit — code: ${code} signal: ${signal} | tokens: ${state.tokensTotal} | tools: ${state.toolCalls} | sends: ${state.sendCalls} | duration: ${state.duration}s | output: ${gotFirstOutput}${state.killedBy ? ` | killed: ${state.killedBy}` : ''} | restarts: ${state.restarts}`);
     writeState();
 
     if (shouldRestart(code, signal)) {
       state.restarts++;
       const delay = jitteredDelay(RESTART_DELAY_S * 1000);
-      log(`RESTART — attempt ${state.restarts}${MAX_RESTARTS > 0 ? `/${MAX_RESTARTS}` : ''} in ${Math.round(delay / 1000)}s`, 'warn');
+      log(`RESTART — attempt ${state.restarts}${MAX_RESTARTS > 0 ? `/${MAX_RESTARTS}` : ''} in ${Math.round(delay / 1000)}s`);
       resetPerRunState();
       setTimeout(() => {
         startChild();
@@ -702,7 +642,7 @@ function startChild() {
           (state.killedBy && NO_RESTART_REASONS.has(state.killedBy)) ? `hard kill (${state.killedBy})` :
           (MAX_RESTARTS > 0 && state.restarts >= MAX_RESTARTS) ? `max restarts reached (${MAX_RESTARTS})` :
           'restart not enabled';
-        log(`NOT RESTARTING — ${reason}`, 'warn');
+        log(`NOT RESTARTING — ${reason}`);
       }
       if (logStream) logStream.end();
       process.exit(code ?? 1);
@@ -714,7 +654,7 @@ function startChild() {
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
-    log(`Received ${sig}, forwarding to child`, 'warn');
+    log(`Received ${sig}, forwarding to child`);
     nikiTerminated = true;
     if (child) child.kill(sig);
   });
