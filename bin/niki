@@ -322,6 +322,21 @@ function killChild(reason) {
   if (killed || !child) return;
   killed = true;
   state.killedBy = reason;
+
+  // Make kill events unmissable in interleaved log streams
+  const banner = [
+    '',
+    '🦜 ══════════════════════════════════════════════',
+    `🦜  NIKI KILL — ${reason.toUpperCase()}`,
+    `🦜  tokens: ${state.tokensTotal.toLocaleString()}/${BUDGET.toLocaleString()} | duration: ${Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000)}s`,
+    `🦜  sends: ${state.sendCallsThisMinute}/${MAX_SENDS}/min | tools: ${state.toolCallsThisMinute}/${MAX_TOOL_CALLS}/min`,
+    '🦜 ══════════════════════════════════════════════',
+    '',
+  ];
+  for (const line of banner) {
+    process.stderr.write(`[niki] ${line}\n`);
+    if (logStream) logStream.write(line + '\n');
+  }
   log(`KILL — reason: ${reason} | tokens: ${state.tokensTotal}/${BUDGET} | sends: ${state.sendCallsThisMinute}/min | tools: ${state.toolCallsThisMinute}/min`, 'error');
 
   child.kill('SIGTERM');
