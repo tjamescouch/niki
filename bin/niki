@@ -177,6 +177,13 @@ if (LOG_FILE) {
   logStream = createWriteStream(resolve(LOG_FILE), { flags: 'a' });
 }
 
+// Format bytes/tokens in human-readable form
+function fmtSize(n) {
+  if (n >= 1000000) return `${(n/1000000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n/1000).toFixed(1)}K`;
+  return String(n);
+}
+
 function log(msg, level = 'info', fields = null) {
   const numLevel = LOG_LEVELS[level] ?? LOG_LEVELS.info;
   if (numLevel < LOG_LEVEL) return;
@@ -193,8 +200,25 @@ function log(msg, level = 'info', fields = null) {
     const prefix = level === 'info' ? '' : `[${level.toUpperCase()}] `;
     const line = `[${ts}] ${prefix}${msg}`;
     if (logStream) logStream.write(line + '\n');
-    process.stderr.write(`[niki] ${line}\n`);
+
+    // For stderr: use concise format at info level, verbose at debug
+    if (level === 'debug' || LOG_LEVEL === LOG_LEVELS.debug) {
+      process.stderr.write(`[niki] ${line}\n`);
+    } else if (level === 'info') {
+      // Concise format: strip timestamp, just show the message
+      process.stderr.write(`[niki] ${msg}\n`);
+    } else {
+      // Warn/error: show full line
+      process.stderr.write(`[niki] ${line}\n`);
+    }
   }
+}
+
+// Log API traffic in human-readable format
+function logAPI(tokensIn, tokensOut) {
+  const budgetPct = ((state.tokensTotal / BUDGET) * 100).toFixed(1);
+  const msg = `[API: ${fmtSize(tokensIn)} → / ${fmtSize(tokensOut)} ←] Budget: ${fmtSize(state.tokensTotal)}/${fmtSize(BUDGET)} (${budgetPct}%)`;
+  log(msg, 'info');
 }
 
 function writeState() {
@@ -263,6 +287,9 @@ const TOKEN_PATTERNS = [
 
 function parseTokens(line) {
   let changed = false;
+  const prevIn = state.tokensIn;
+  const prevOut = state.tokensOut;
+
   for (const { regex, field } of TOKEN_PATTERNS) {
     regex.lastIndex = 0;
     let match;
@@ -278,6 +305,15 @@ function parseTokens(line) {
     }
   }
   if (changed) {
+    const deltaIn = state.tokensIn - prevIn;
+    const deltaOut = state.tokensOut - prevOut;
+
+    // Human-readable API traffic log
+    if (deltaIn > 0 || deltaOut > 0) {
+      logAPI(deltaIn, deltaOut);
+    }
+
+    // Verbose log for debug mode
     log(`Tokens — in: ${state.tokensIn.toLocaleString()} out: ${state.tokensOut.toLocaleString()} total: ${state.tokensTotal.toLocaleString()}/${BUDGET.toLocaleString()} (${Math.round(state.tokensTotal / BUDGET * 100)}%)`, 'debug');
     checkBudgetThresholds();
   }
@@ -534,7 +570,7 @@ function onChildOutput() {
   }
   if (!gotFirstOutput) {
     gotFirstOutput = true;
-    log(`First output received after ${Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000)}s — switching to stall-timeout=${STALL_TIMEOUT_S}s`, 'info');
+    log(`First output received after ${Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000)}s — switching to stall-timeout=${STALL_TIMEOUT_S}s`, 'debug');
   }
   resetStallTimer();
 }
@@ -655,10 +691,14 @@ function scheduleAbortPoll() {
 let timeoutId = null;
 
 function startChild() {
-  log(`Starting: ${childCmd} ${childArgs.join(' ').substring(0, 100)}...`, 'info');
-  log(`Budget: ${BUDGET.toLocaleString()} tokens | Timeout: ${TIMEOUT_S}s | Startup: ${STARTUP_TIMEOUT_S}s | Stall: ${STALL_TIMEOUT_S}s | Dead air: ${DEAD_AIR_TIMEOUT_M}min | Max sends: ${MAX_SENDS}/min | Max tools: ${MAX_TOOL_CALLS}/min`, 'info');
+  // Concise startup message
+  const cmd = `${childCmd} ${childArgs.join(' ').substring(0, 60)}...`;
+  log(`[START] ${cmd} | Budget: ${fmtSize(BUDGET)} tokens | Timeout: ${TIMEOUT_S}s`, 'info');
+
+  // Verbose details at debug level
+  log(`Budget: ${BUDGET.toLocaleString()} tokens | Timeout: ${TIMEOUT_S}s | Startup: ${STARTUP_TIMEOUT_S}s | Stall: ${STALL_TIMEOUT_S}s | Dead air: ${DEAD_AIR_TIMEOUT_M}min | Max sends: ${MAX_SENDS}/min | Max tools: ${MAX_TOOL_CALLS}/min`, 'debug');
   if (RESTART) {
-    log(`Restart: enabled | max: ${MAX_RESTARTS || 'unlimited'} | delay: ${RESTART_DELAY_S}s ±30% | restarts so far: ${state.restarts}`, 'info');
+    log(`Restart: enabled | max: ${MAX_RESTARTS || 'unlimited'} | delay: ${RESTART_DELAY_S}s ±30% | restarts so far: ${state.restarts}`, 'debug');
   }
 
   child = spawn(childCmd, childArgs, {
@@ -712,13 +752,13 @@ function startChild() {
 
   // Start stall detection
   if (STALL_TIMEOUT_S > 0 || STARTUP_TIMEOUT_S > 0) {
-    log(`Stall detection: startup-timeout=${STARTUP_TIMEOUT_S}s, stall-timeout=${STALL_TIMEOUT_S}s, max-nudges=${MAX_NUDGES}`, 'info');
+    log(`Stall detection: startup-timeout=${STARTUP_TIMEOUT_S}s, stall-timeout=${STALL_TIMEOUT_S}s, max-nudges=${MAX_NUDGES}`, 'debug');
     resetStallTimer();
   }
 
   // Start dead air detection
   if (DEAD_AIR_TIMEOUT_M > 0) {
-    log(`Dead air detection: ${DEAD_AIR_TIMEOUT_M}min threshold, ${Math.round(DEAD_AIR_POLL_MS / 1000)}s poll interval`, 'info');
+    log(`Dead air detection: ${DEAD_AIR_TIMEOUT_M}min threshold, ${Math.round(DEAD_AIR_POLL_MS / 1000)}s poll interval`, 'debug');
     scheduleDeadAirPoll();
   }
 
@@ -747,7 +787,15 @@ function startChild() {
     state.gotFirstOutput = gotFirstOutput;
 
     const level = state.killedBy ? 'error' : (code === 0 ? 'info' : 'warn');
-    log(`Exit — code: ${code} signal: ${signal} | tokens: ${state.tokensTotal.toLocaleString()} | tools: ${state.toolCalls} | sends: ${state.sendCalls} | duration: ${state.duration}s | output: ${gotFirstOutput}${state.killedBy ? ` | killed: ${state.killedBy}` : ''} | restarts: ${state.restarts}`, level);
+
+    // Concise exit message
+    const exitMsg = state.killedBy
+      ? `[EXIT] Killed: ${state.killedBy} | Tokens: ${fmtSize(state.tokensTotal)} | ${state.duration}s`
+      : `[EXIT] Code: ${code} | Tokens: ${fmtSize(state.tokensTotal)} | ${state.duration}s`;
+    log(exitMsg, level);
+
+    // Verbose details at debug level
+    log(`Exit — code: ${code} signal: ${signal} | tokens: ${state.tokensTotal.toLocaleString()} | tools: ${state.toolCalls} | sends: ${state.sendCalls} | duration: ${state.duration}s | output: ${gotFirstOutput}${state.killedBy ? ` | killed: ${state.killedBy}` : ''} | restarts: ${state.restarts}`, 'debug');
     writeState();
     writeMetrics();
 
