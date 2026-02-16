@@ -109,6 +109,32 @@ const MAX_RESTARTS  = parseInt(opts['max-restarts'], 10);
 const RESTART_DELAY_S = parseFloat(opts['restart-delay']);
 const LOG_JSON      = opts['log-json'];
 
+// --- Invocation rate limiting (prevent tight crash loops) ---
+
+const INVOCATION_LOCKFILE = `/tmp/niki-invocation-${process.pid}.lock`;
+const GLOBAL_LOCKFILE = '/tmp/niki-last-invocation';
+
+try {
+  if (existsSync(GLOBAL_LOCKFILE)) {
+    const lastInvocation = parseFloat(readFileSync(GLOBAL_LOCKFILE, 'utf8'));
+    const now = Date.now() / 1000;
+    const delta = now - lastInvocation;
+
+    if (delta < 1.0) {
+      console.error(`[niki] ERROR: Invoked too quickly (${delta.toFixed(3)}s since last invocation)`);
+      console.error(`[niki] Refusing to start — something is calling niki in a tight loop`);
+      console.error(`[niki] This prevents expensive crash loops. Wait at least 1 second between invocations.`);
+      process.exit(42); // Exit code 42 = rate-limited
+    }
+  }
+
+  // Update timestamp
+  writeFileSync(GLOBAL_LOCKFILE, String(Date.now() / 1000));
+} catch (err) {
+  // Non-fatal if we can't write lockfile (e.g., permission issues)
+  console.error(`[niki] Warning: Could not check invocation rate (${err.message})`);
+}
+
 // --- Log levels ---
 
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
