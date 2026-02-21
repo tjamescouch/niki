@@ -34,6 +34,7 @@ if (SEPARATOR === -1 || SEPARATOR === process.argv.length - 1) {
 Usage: niki [options] -- <command> [args...]
 
 Options:
+  --profile <name>       Apply a preset profile (default: none; profiles: longrun)
   --budget <tokens>       Max total tokens (input+output) before SIGTERM (default: 1000000)
   --timeout <seconds>     Max wall-clock runtime before SIGTERM (default: 3600)
   --max-sends <n>         Max agentchat_send calls per minute (default: 10)
@@ -55,6 +56,7 @@ Options:
   --restart-delay <secs>  Delay between restarts with ±30% jitter (default: 5)
 
 Examples:
+  niki --profile longrun -- gro --persistent --model sonnet
   niki --budget 500000 -- claude -p "your prompt" --verbose
   niki --timeout 1800 --max-sends 5 -- claude -p "..." --model sonnet --verbose
   niki --restart --max-restarts 10 -- gro --model gpt-5.2 "your prompt"`);
@@ -65,28 +67,65 @@ const nikiArgs = process.argv.slice(2, SEPARATOR);
 const childCmd = process.argv[SEPARATOR + 1];
 const childArgs = process.argv.slice(SEPARATOR + 2);
 
+function getProfileArg(args) {
+  const i = args.indexOf("--profile");
+  if (i === -1) return null;
+  const v = args[i + 1];
+  return v && !v.startsWith("-") ? v : null;
+}
+
+const DEFAULTS = {
+  budget: "1000000",
+  timeout: "3600",
+  "max-sends": "10",
+  "max-tool-calls": "30",
+  "stall-timeout": "60",
+  "startup-timeout": "180",
+  "dead-air-timeout": "5",
+  "max-nudges": "3",
+  cooldown: "5",
+  "poll-interval": "1000",
+  "max-restarts": "0",
+  "restart-delay": "5"
+};
+
+const PROFILES = {
+  longrun: {
+    timeout: "86400",
+    "stall-timeout": "0",
+    "startup-timeout": "0",
+    "dead-air-timeout": "0",
+    cooldown: "15"
+  }
+};
+
+const profileArg = getProfileArg(nikiArgs);
+const D = profileArg && PROFILES[profileArg] ? { ...DEFAULTS, ...PROFILES[profileArg] } : DEFAULTS;
+
+
 const { values: opts } = parseArgs({
   args: nikiArgs,
   options: {
-    budget:          { type: 'string', default: '1000000' },
-    timeout:         { type: 'string', default: '3600' },
-    'max-sends':     { type: 'string', default: '10' },
-    'max-tool-calls': { type: 'string', default: '30' },
-    'stall-timeout': { type: 'string', default: '60' },
-    'startup-timeout': { type: 'string', default: '180' },
-    'dead-air-timeout': { type: 'string', default: '1440' },
-    'max-nudges':    { type: 'string', default: '3' },
+    profile:        { type: 'string' },
+    budget:          { type: 'string', default: D.budget },
+    timeout:         { type: 'string', default: D.timeout },
+    'max-sends':     { type: 'string', default: D["max-sends"] },
+    'max-tool-calls': { type: 'string', default: D["max-tool-calls"] },
+    'stall-timeout': { type: 'string', default: D["stall-timeout"] },
+    'startup-timeout': { type: 'string', default: D["startup-timeout"] },
+    'dead-air-timeout': { type: 'string', default: D["dead-air-timeout"] },
+    'max-nudges':    { type: 'string', default: D["max-nudges"] },
     log:             { type: 'string' },
     'log-level':     { type: 'string', default: 'info' },
     'log-json':      { type: 'boolean', default: false },
     state:           { type: 'string' },
     metrics:         { type: 'string' },
-    cooldown:        { type: 'string', default: '5' },
+    cooldown:        { type: 'string', default: D.cooldown },
     'abort-file':    { type: 'string' },
-    'poll-interval': { type: 'string', default: '1000' },
+    'poll-interval': { type: 'string', default: D["poll-interval"] },
     restart:         { type: 'boolean', default: false },
-    'max-restarts':  { type: 'string', default: '0' },
-    'restart-delay': { type: 'string', default: '5' },
+    'max-restarts':  { type: 'string', default: D["max-restarts"] },
+    'restart-delay': { type: 'string', default: D["restart-delay"] },
   },
 });
 
