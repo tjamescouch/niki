@@ -54,6 +54,7 @@ Options:
   --restart               Restart the child process when it exits (default: off)
   --max-restarts <n>      Max restart attempts, 0=unlimited (default: 0)
   --restart-delay <secs>  Delay between restarts with ±30% jitter (default: 5)
+  --kill-orphaned-mcp     Kill stale agentchat-mcp processes on startup (default: off)
 
 Examples:
   niki --profile longrun -- gro --persistent --model sonnet
@@ -126,6 +127,7 @@ const { values: opts } = parseArgs({
     restart:         { type: 'boolean', default: false },
     'max-restarts':  { type: 'string', default: D["max-restarts"] },
     'restart-delay': { type: 'string', default: D["restart-delay"] },
+    'kill-orphaned-mcp': { type: 'boolean', default: false },
   },
 });
 
@@ -146,6 +148,7 @@ const METRICS_FILE  = opts.metrics;
 const RESTART       = opts.restart;
 const MAX_RESTARTS  = parseInt(opts['max-restarts'], 10);
 const RESTART_DELAY_S = parseFloat(opts['restart-delay']);
+const KILL_ORPHANED_MCP = opts['kill-orphaned-mcp'];
 const LOG_JSON      = opts['log-json'];
 
 // --- Invocation rate limiting (prevent tight crash loops) ---
@@ -738,6 +741,17 @@ function startChild() {
   log(`Budget: ${BUDGET.toLocaleString()} tokens | Timeout: ${TIMEOUT_S}s | Startup: ${STARTUP_TIMEOUT_S}s | Stall: ${STALL_TIMEOUT_S}s | Dead air: ${DEAD_AIR_TIMEOUT_M}min | Max sends: ${MAX_SENDS}/min | Max tools: ${MAX_TOOL_CALLS}/min`, 'debug');
   if (RESTART) {
     log(`Restart: enabled | max: ${MAX_RESTARTS || 'unlimited'} | delay: ${RESTART_DELAY_S}s ±30% | restarts so far: ${state.restarts}`, 'debug');
+  }
+
+  // If --kill-orphaned-mcp is set, kill stale agentchat-mcp procs from prior sessions.
+  // Without this they accumulate on restart and displace the new agent's WS connection.
+  if (KILL_ORPHANED_MCP) {
+    try {
+      execSync('pkill -f agentchat-mcp', { stdio: 'ignore' });
+      log('Killed orphaned agentchat-mcp processes', 'debug');
+    } catch {
+      // pkill exits non-zero when no processes matched — that's fine
+    }
   }
 
   child = spawn(childCmd, childArgs, {
