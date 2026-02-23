@@ -740,6 +740,16 @@ function startChild() {
     log(`Restart: enabled | max: ${MAX_RESTARTS || 'unlimited'} | delay: ${RESTART_DELAY_S}s ±30% | restarts so far: ${state.restarts}`, 'debug');
   }
 
+  // Kill orphaned MCP server processes from prior sessions before spawning
+  // a new child. Without this, stale agentchat-mcp procs accumulate across
+  // restarts and displace the new agent's WebSocket connection via session_displaced.
+  try {
+    execSync('pkill -f agentchat-mcp', { stdio: 'ignore' });
+    log('Killed orphaned agentchat-mcp processes', 'debug');
+  } catch {
+    // pkill exits non-zero when no processes matched — that's fine
+  }
+
   child = spawn(childCmd, childArgs, {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: process.env,
