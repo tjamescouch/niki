@@ -55,12 +55,16 @@ Options:
   --max-restarts <n>      Max restart attempts, 0=unlimited (default: 0)
   --restart-delay <secs>  Delay between restarts with ±30% jitter (default: 5)
   --kill-orphaned-mcp     Kill stale agentchat-mcp processes on startup (default: off)
+  --on-kill <command>     Run shell command when agent is killed (receives context via env vars)
+                          Env vars: NIKI_KILL_REASON, NIKI_TOKENS, NIKI_BUDGET, NIKI_DURATION,
+                          NIKI_SENDS, NIKI_TOOL_CALLS, NIKI_PID, NIKI_CMD
 
 Examples:
   niki --profile longrun -- gro --persistent --model sonnet
   niki --budget 500000 -- claude -p "your prompt" --verbose
   niki --timeout 1800 --max-sends 5 -- claude -p "..." --model sonnet --verbose
-  niki --restart --max-restarts 10 -- gro --model gpt-5.2 "your prompt"`);
+  niki --restart --max-restarts 10 -- gro --model gpt-5.2 "your prompt"
+  niki --on-kill 'curl -d "$NIKI_KILL_REASON: $NIKI_TOKENS tokens" ntfy.sh/my-agents' -- claude -p "..."`);
   process.exit(1);
 }
 
@@ -128,6 +132,7 @@ const { values: opts } = parseArgs({
     'max-restarts':  { type: 'string', default: D["max-restarts"] },
     'restart-delay': { type: 'string', default: D["restart-delay"] },
     'kill-orphaned-mcp': { type: 'boolean', default: false },
+    'on-kill':           { type: 'string' },
   },
 });
 
@@ -149,6 +154,7 @@ const RESTART       = opts.restart;
 const MAX_RESTARTS  = parseInt(opts['max-restarts'], 10);
 const RESTART_DELAY_S = parseFloat(opts['restart-delay']);
 const KILL_ORPHANED_MCP = opts['kill-orphaned-mcp'];
+const ON_KILL       = opts['on-kill'];
 const LOG_JSON      = opts['log-json'];
 
 // --- Invocation rate limiting (prevent tight crash loops) ---
@@ -417,6 +423,35 @@ function checkRateLimits() {
   }
   return null;
 }
+// --- Kill notification hook ---
+
+function fireOnKill(reason) {
+  if (!ON_KILL) return;
+  const duration = Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000);
+  const env = {
+    ...process.env,
+    NIKI_KILL_REASON: reason,
+    NIKI_TOKENS: String(state.tokensTotal),
+    NIKI_BUDGET: String(BUDGET),
+    NIKI_DURATION: String(duration),
+    NIKI_SENDS: String(state.sendCalls),
+    NIKI_TOOL_CALLS: String(state.toolCalls),
+    NIKI_PID: String(state.pid),
+    NIKI_CMD: childCmd,
+  };
+  try {
+    const hook = spawn('sh', ['-c', ON_KILL], {
+      env,
+      stdio: 'ignore',
+      detached: true,
+    });
+    hook.unref();
+    log(`on-kill hook fired: ${ON_KILL}`, 'debug');
+  } catch (err) {
+    log(`on-kill hook failed: ${err.message}`, 'warn');
+  }
+}
+
 // --- Kill logic ---
 
 let child = null;
@@ -442,6 +477,8 @@ function killChild(reason) {
     if (logStream) logStream.write(line + '\n');
   }
   log(`KILL — reason: ${reason} | tokens: ${state.tokensTotal}/${BUDGET} | sends: ${state.sendCallsThisMinute}/min | tools: ${state.toolCallsThisMinute}/min`, 'error');
+
+  fireOnKill(reason);
 
   child.kill('SIGTERM');
 
