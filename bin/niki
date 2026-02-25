@@ -55,8 +55,10 @@ Options:
   --max-restarts <n>      Max restart attempts, 0=unlimited (default: 0)
   --restart-delay <secs>  Delay between restarts with ±30% jitter (default: 5)
   --kill-orphaned-mcp     Kill stale agentchat-mcp processes on startup (default: off)
+  --nick <name>          Agent display name (exported as NIKI_NICK in on-kill hook)
+  --ntfy-secret <secret>  NTFY topic secret (exported as NIKI_NTFY_TOPIC in on-kill hook)
   --on-kill <command>     Run shell command when agent is killed (receives context via env vars)
-                          Env vars: NIKI_KILL_REASON, NIKI_TOKENS, NIKI_BUDGET, NIKI_DURATION,
+                          Env vars: NIKI_KILL_REASON, NIKI_TOKENS, NIKI_BUDGET, NIKI_DURATION, NIKI_NICK, NIKI_NTFY_TOPIC,
                           NIKI_SENDS, NIKI_TOOL_CALLS, NIKI_PID, NIKI_CMD
 
 Examples:
@@ -133,6 +135,8 @@ const { values: opts } = parseArgs({
     'restart-delay': { type: 'string', default: D["restart-delay"] },
     'kill-orphaned-mcp': { type: 'boolean', default: false },
     'on-kill':           { type: 'string' },
+    'nick':              { type: 'string' },
+    'ntfy-secret':       { type: 'string' },
   },
 });
 
@@ -438,6 +442,8 @@ function fireOnKill(reason) {
     NIKI_TOOL_CALLS: String(state.toolCalls),
     NIKI_PID: String(state.pid),
     NIKI_CMD: childCmd,
+    NIKI_NICK: opts.nick || '',
+    NIKI_NTFY_TOPIC: opts['ntfy-secret'] || '',
   };
   try {
     const hook = spawn('sh', ['-c', ON_KILL], {
