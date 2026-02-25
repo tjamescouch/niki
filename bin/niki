@@ -430,8 +430,10 @@ function checkRateLimits() {
 // --- Kill notification hook ---
 
 function fireOnKill(reason) {
-  if (!ON_KILL) return;
+  const ntfyTopic = opts['ntfy-secret'] || process.env.NTFY || '';
+  if (!ON_KILL && !ntfyTopic) return;
   const duration = Math.round((Date.now() - new Date(state.startedAt).getTime()) / 1000);
+  const agentNick = opts.nick || '';
   const env = {
     ...process.env,
     NIKI_KILL_REASON: reason,
@@ -442,19 +444,27 @@ function fireOnKill(reason) {
     NIKI_TOOL_CALLS: String(state.toolCalls),
     NIKI_PID: String(state.pid),
     NIKI_CMD: childCmd,
-    NIKI_NICK: opts.nick || '',
-    NIKI_NTFY_TOPIC: opts['ntfy-secret'] || '',
+    NIKI_NICK: agentNick,
+    NIKI_NTFY_TOPIC: ntfyTopic,
   };
-  try {
-    const hook = spawn('sh', ['-c', ON_KILL], {
-      env,
-      stdio: 'ignore',
-      detached: true,
-    });
-    hook.unref();
-    log(`on-kill hook fired: ${ON_KILL}`, 'debug');
-  } catch (err) {
-    log(`on-kill hook failed: ${err.message}`, 'warn');
+  // Auto-build NTFY curl if topic is available
+  // Uses NIKI_NICK and NIKI_KILL_REASON env vars (safe shell expansion, no injection)
+  const ntfyCmd = ntfyTopic
+    ? `curl -sf -d "\${NIKI_NICK:+[$NIKI_NICK] }killed: $NIKI_KILL_REASON" "https://ntfy.sh/${ntfyTopic}"`
+    : null;
+  const cmdsToRun = [ON_KILL, ntfyCmd].filter(Boolean);
+  for (const cmd of cmdsToRun) {
+    try {
+      const hook = spawn('sh', ['-c', cmd], {
+        env,
+        stdio: 'ignore',
+        detached: true,
+      });
+      hook.unref();
+      log(`on-kill hook fired: ${cmd}`, 'debug');
+    } catch (err) {
+      log(`on-kill hook failed: ${err.message}`, 'warn');
+    }
   }
 }
 
