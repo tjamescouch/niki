@@ -133,6 +133,7 @@ const { values: opts } = parseArgs({
     'restart-delay': { type: 'string', default: D["restart-delay"] },
     'kill-orphaned-mcp': { type: 'boolean', default: false },
     'on-kill':           { type: 'string' },
+    nick:                { type: 'string' },
   },
 });
 

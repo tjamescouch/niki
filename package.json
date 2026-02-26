@@ -1,6 +1,6 @@
 {
   "name": "@tjamescouch/niki",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "description": "Deterministic process supervisor for AI agents — token budgets, rate limits, and abort control",
   "bin": {
     "niki": "./bin/niki"
